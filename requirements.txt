@@ -1,0 +1,3 @@
+aiogram==2.25.1
+peewee==3.16.2
+names==0.3.0 
