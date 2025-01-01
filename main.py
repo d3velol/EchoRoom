@@ -313,6 +313,14 @@ async def cmd_goto(message: types.Message):
             
         channel = int(args[1])
         user_id = message.from_user.id
+        
+        # Проверка на тюремный канал
+        if channel == config.PRISON_CHANNEL:
+            await message.answer(
+                random.choice(config.PRISON_MESSAGES),
+                parse_mode="Markdown"
+            )
+            return
             
         if channel < config.MIN_CHANNEL or channel > config.MAX_CHANNEL:
             await message.answer(
@@ -1008,6 +1016,14 @@ async def handle_message(message: types.Message):
         
         asyncio.create_task(delete_message_after(status_msg, config.DELETE_STATS_AFTER))
 
+        # После отправки сообщений
+        channel_mapping = message_mappings.setdefault(user.channel, {})
+        message_mapping = channel_mapping.setdefault(message.message_id, {})
+        
+        for result in results:
+            if isinstance(result, types.Message):
+                message_mapping[result.chat.id] = result.message_id
+
     except Exception as e:
         print(f"[ERROR] Error in handle_message: {e}")
         traceback.print_exc()
@@ -1089,16 +1105,10 @@ def get_least_populated_channel() -> int:
         # В случае ошибки возвращаем случайный канал
         return random.randint(config.MIN_CHANNEL, config.MAX_CHANNEL)
 
-@dp.message_handler(content_types=['photo', 'video', 'animation', 'document', 'media_group'])
+@dp.message_handler(content_types=['photo', 'video', 'animation', 'document', 'media_group', 'sticker'])
 async def handle_media(message: types.Message):
     try:
-        if message.from_user.id not in config.MEDIA_ALLOWED_USERS:
-            await message.answer(
-                "❌ *Ошибка*: У вас нет прав для отправки медиа",
-                parse_mode="Markdown"
-            )
-            return
-
+        # Убираем проверку на MEDIA_ALLOWED_USERS
         start_time = time.time()
         user = User.get_user(message.from_user.id)
         if not user:
@@ -1109,15 +1119,19 @@ async def handle_media(message: types.Message):
             )
             return
             
-        # Проверяем тюрьму
-        prison_user = PrisonUser.get_or_none(PrisonUser.user_id == message.from_user.id)
-        if prison_user:
+        # Проверяем задержку между сообщениями
+        current_time = time.time()
+        last_time = last_message_time.get(message.from_user.id, 0)
+        if current_time - last_time < config.MESSAGE_DELAY:
             await message.answer(
-                f"🚔 Вы в тюрьме еще `{prison_user.remaining_time}` секунд",
+                f"⏳ Подождите еще `{int(config.MESSAGE_DELAY - (current_time - last_time))}` секунд",
                 parse_mode="Markdown"
             )
             return
-            
+
+        # Сразу обновляем время последнего сообщения
+        last_message_time[message.from_user.id] = current_time
+
         channel_users = User.get_channel_users(user.channel)
         recipients_count = sum(1 for u in channel_users if u.user_id != message.from_user.id)
             
@@ -1129,14 +1143,25 @@ async def handle_media(message: types.Message):
             asyncio.create_task(delete_message_after(status_msg, config.DELETE_STATS_AFTER))
             return
 
+        # Сначала отправляем статус
+        status_msg = await message.answer(
+            f"📡 Отправка сигнала на канал `{user.channel}Hz`\n"
+            f"👥 Получателей: `{recipients_count}`",
+            parse_mode="Markdown"
+        )
+
         markup = create_user_button(user.name, user)
         
         # Получаем медиа и подпись
         file_id = None
         caption = message.caption or ""
+        media_type = None
         
-        # Берем только первый файл из группы для каждого типа медиа
-        if message.media_group_id:
+        # Определяем тип медиа и file_id
+        if message.sticker:
+            file_id = message.sticker.file_id
+            media_type = 'sticker'
+        elif message.media_group_id:
             if message.photo:
                 file_id = message.photo[-1].file_id
                 media_type = 'photo'
@@ -1162,33 +1187,42 @@ async def handle_media(message: types.Message):
             
         if not file_id:
             return
-            
-        # Отправляем медиа всем пользователям на канале
-        for channel_user in channel_users:
-            try:
-                if media_type == 'photo':
-                    await bot.send_photo(channel_user.user_id, file_id, caption=caption, reply_markup=markup)
-                elif media_type == 'video':
-                    await bot.send_video(channel_user.user_id, file_id, caption=caption, reply_markup=markup)
-                elif media_type == 'animation':
-                    await bot.send_animation(channel_user.user_id, file_id, caption=caption, reply_markup=markup)
-                elif media_type == 'document':
-                    await bot.send_document(channel_user.user_id, file_id, caption=caption, reply_markup=markup)
-                    
-                # Добавляем задержку между отправками
-                await asyncio.sleep(config.BROADCAST_DELAY)
-                    
-            except Exception as e:
-                print(f"Failed to send media to {channel_user.user_id}: {e}")
-                continue
 
-        # Отправляем статус
-        status_msg = await message.answer(
-            f"📡 Твой сигнал доставлен на канал `{user.channel}Hz`\n"
-            f"👥 Получателей: `{recipients_count}`\n"
-            f"⚡️ Время доставки: `{round((time.time() - start_time) * 1000)}ms`",
+        # Создаем список задач для отправки
+        tasks = []
+        for channel_user in channel_users:
+            async def send_with_delay(user_id):
+                await asyncio.sleep(config.BROADCAST_DELAY)
+                if media_type == 'sticker':
+                    return await bot.send_sticker(user_id, file_id, reply_markup=markup)
+                elif media_type == 'photo':
+                    return await bot.send_photo(user_id, file_id, caption=caption, reply_markup=markup)
+                elif media_type == 'video':
+                    return await bot.send_video(user_id, file_id, caption=caption, reply_markup=markup)
+                elif media_type == 'animation':
+                    return await bot.send_animation(user_id, file_id, caption=caption, reply_markup=markup)
+                elif media_type == 'document':
+                    return await bot.send_document(user_id, file_id, caption=caption, reply_markup=markup)
+
+            tasks.append(send_with_delay(channel_user.user_id))
+
+        # Отправляем всем параллельно
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Считаем успешные отправки
+        successful_sends = sum(1 for r in results if not isinstance(r, Exception))
+        
+        execution_time = int((time.time() - start_time) * 1000)
+        time_str = f"{execution_time}ms" if execution_time < 1000 else f"{execution_time/1000:.1f}s"
+
+        # Обновляем статус
+        await status_msg.edit_text(
+            f"📡 Сигнал доставлен на канал `{user.channel}Hz`\n"
+            f"👥 Получателей: `{successful_sends}/{recipients_count}`\n"
+            f"⚡️ Время доставки: `{time_str}`",
             parse_mode="Markdown"
         )
+        
         asyncio.create_task(delete_message_after(status_msg, config.DELETE_STATS_AFTER))
 
     except Exception as e:
@@ -1200,6 +1234,55 @@ async def handle_media(message: types.Message):
             "❌ *Ошибка при отправке медиа*",
             parse_mode="Markdown"
         )
+
+@dp.message_handler(content_types=['message_reaction'])
+async def handle_reaction(message: types.Message):
+    try:
+        # Получаем информацию о реакции
+        reaction = message.message_reaction
+        if not reaction:
+            return
+            
+        # Получаем канал пользователя
+        user = User.get_user(message.from_user.id)
+        if not user:
+            return
+            
+        # Получаем mapping сообщений для этого канала
+        channel_mapping = message_mappings.get(user.channel, {})
+        if not channel_mapping:
+            return
+            
+        # Получаем mapping для конкретного сообщения
+        message_mapping = channel_mapping.get(message.message_id, {})
+        if not message_mapping:
+            return
+            
+        # Устанавливаем реакцию на все связанные сообщения
+        for user_id, msg_id in message_mapping.items():
+            try:
+                await bot.set_message_reaction(
+                    chat_id=user_id,
+                    message_id=msg_id,
+                    reaction=[types.ReactionType(type="emoji", emoji=reaction.emoji)]
+                )
+            except Exception as e:
+                print(f"Failed to set reaction for user {user_id}: {e}")
+                continue
+                
+        # Устанавливаем реакцию на оригинальное сообщение
+        try:
+            await bot.set_message_reaction(
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                reaction=[types.ReactionType(type="emoji", emoji=reaction.emoji)]
+            )
+        except Exception as e:
+            print(f"Failed to set reaction on original message: {e}")
+
+    except Exception as e:
+        print(f"[ERROR] Error in handle_reaction: {e}")
+        traceback.print_exc()
 
 if __name__ == '__main__':
     init_db()
